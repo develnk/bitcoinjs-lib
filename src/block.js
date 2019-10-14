@@ -14,7 +14,12 @@ function Block () {
   this.timestamp = 0
   this.bits = 0
   this.nonce = 0
+  this.finalSaplingRoot = null
+  this.solutionSize = 0
+  this.solution = null
 }
+
+Block.ZCASH_HEADER_BYTE_SIZE = 1487
 
 Block.fromBuffer = function (buffer) {
   if (buffer.length < 80) throw new Error('Buffer too small (< 80 bytes)')
@@ -37,24 +42,27 @@ Block.fromBuffer = function (buffer) {
     return i
   }
 
-  var block = new Block()
-  block.version = readInt32()
-  block.prevHash = readSlice(32)
-  block.merkleRoot = readSlice(32)
-  block.timestamp = readUInt32()
-  block.bits = readUInt32()
-  block.nonce = readUInt32()
-
-  if (buffer.length === 80) return block
-
   function readVarInt () {
     var vi = varuint.decode(buffer, offset)
     offset += varuint.decode.bytes
     return vi
   }
 
+  var block = new Block()
+  block.version = readInt32()
+  block.prevHash = readSlice(32)
+  block.merkleRoot = readSlice(32)
+  block.finalSaplingRoot = readSlice(32)
+  block.timestamp = readUInt32()
+  block.bits = readUInt32()
+  block.nonce = readSlice(32)
+  block.solutionSize = readVarInt()
+  block.solution = readSlice(100)
+
+  if (buffer.length === 80) return block
+
   function readTransaction () {
-    var tx = Transaction.fromBuffer(buffer.slice(offset), false, true)
+    var tx = Transaction.fromBuffer(buffer.slice(offset), true)
     offset += tx.byteLength()
     return tx
   }
@@ -71,11 +79,13 @@ Block.fromBuffer = function (buffer) {
 }
 
 Block.prototype.byteLength = function (headersOnly) {
-  if (headersOnly || !this.transactions) return 80
-
-  return 80 + varuint.encodingLength(this.transactions.length) + this.transactions.reduce(function (a, x) {
-    return a + x.byteLength()
-  }, 0)
+  if (headersOnly) {
+    return Block.ZCASH_HEADER_BYTE_SIZE
+  }
+  return Block.ZCASH_HEADER_BYTE_SIZE +
+      varuint.encodingLength(this.transactions.length) + this.transactions.reduce(function (a, x) {
+        return a + x.byteLength()
+      }, 0)
 }
 
 Block.fromHex = function (hex) {
@@ -119,9 +129,13 @@ Block.prototype.toBuffer = function (headersOnly) {
   writeInt32(this.version)
   writeSlice(this.prevHash)
   writeSlice(this.merkleRoot)
+  writeSlice(this.finalSaplingRoot)
   writeUInt32(this.timestamp)
   writeUInt32(this.bits)
-  writeUInt32(this.nonce)
+  writeSlice(this.nonce)
+  varuint.encode(this.solutionSize, buffer, offset)
+  offset += varuint.encode.bytes
+  writeSlice(this.solution)
 
   if (headersOnly || !this.transactions) return buffer
 
@@ -145,7 +159,18 @@ Block.calculateTarget = function (bits) {
   var exponent = ((bits & 0xff000000) >> 24) - 3
   var mantissa = bits & 0x007fffff
   var target = Buffer.alloc(32, 0)
-  target.writeUInt32BE(mantissa, 28 - exponent)
+  if (exponent < 0) {
+    // If it is negative, we will overflow the target buffer so we have to slice the mantissa to fit
+    mantissa = mantissa >> (8 * Math.abs(exponent))
+    target.writeUInt32BE(mantissa, 28)
+  } else if (exponent > 28) {
+    // If it is greater than 28, we need to shift the mantissa since the offset cannot be greater than 32 - 4
+    // (safe-buffer restriction)
+    mantissa <<= 8 * (exponent - 28)
+    target.writeUInt32BE(mantissa, 0)
+  } else {
+    target.writeUInt32BE(mantissa, 28 - exponent)
+  }
   return target
 }
 
